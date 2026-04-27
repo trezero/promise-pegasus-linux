@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pegasus3-R management CLI — status, diagnostics, maintenance.
+# Pegasus3-R management CLI — status, diagnostics, maintenance, performance.
 # See docs/ for full setup procedure.
 set -u
 
@@ -17,28 +17,48 @@ SCSI_DRIVER="stex"
 FS_TYPE="ext4"
 KERNEL_PARAM="pci=realloc"
 
+# Performance baselines (Pegasus3-R over Thunderbolt 2/3, RAID5 of 4x SSDs)
+# Used purely to colorize speed-test output.
+PERF_SEQ_GOOD=700      # MB/s — green at/above
+PERF_SEQ_OK=350        # MB/s — yellow at/above, red below
+
 # ---- Colors (disabled when stdout is not a TTY) ----
 if [[ -t 1 ]]; then
     C_RESET=$'\033[0m'
     C_RED=$'\033[31m'
     C_GREEN=$'\033[32m'
     C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
     C_CYAN=$'\033[36m'
+    C_GRAY=$'\033[90m'
     C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
 else
-    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+    C_MAGENTA=""; C_CYAN=""; C_GRAY=""; C_BOLD=""; C_DIM=""
 fi
 
-ok()   { printf '%s[ OK ]%s %s\n' "$C_GREEN"  "$C_RESET" "$*"; }
-warn() { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
-fail() { printf '%s[FAIL]%s %s\n' "$C_RED"    "$C_RESET" "$*"; }
-hdr()  { printf '\n%s%s== %s ==%s\n' "$C_CYAN" "$C_BOLD" "$*" "$C_RESET"; }
-info() { printf '       %s\n' "$*"; }
+ok()    { printf '  %s●%s %s\n' "$C_GREEN"  "$C_RESET" "$*"; }
+warn()  { printf '  %s●%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+fail()  { printf '  %s●%s %s\n' "$C_RED"    "$C_RESET" "$*"; }
+info()  { printf '    %s%s%s\n' "$C_GRAY" "$*" "$C_RESET"; }
+
+hdr() {
+    local title="$*"
+    local line
+    printf -v line '%*s' $((${#title} + 4)) ''
+    line="${line// /─}"
+    printf '\n%s┌%s┐%s\n'      "$C_CYAN" "$line" "$C_RESET"
+    printf '%s│%s  %s%s%s  %s│%s\n' \
+        "$C_CYAN" "$C_RESET" "$C_BOLD" "$title" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf '%s└%s┘%s\n\n'      "$C_CYAN" "$line" "$C_RESET"
+}
 
 trap 'warn "Unexpected error on line $LINENO (continuing)"' ERR
 
 pause() {
-    printf '\n%sPress Enter to continue...%s' "$C_CYAN" "$C_RESET"
+    printf '\n%s↵ Press Enter to continue...%s' "$C_DIM" "$C_RESET"
     read -r _ || true
 }
 
@@ -46,7 +66,7 @@ confirm_yes() {
     local prompt="$1" reply
     printf '%s%s%s [y/N] ' "$C_YELLOW" "$prompt" "$C_RESET"
     read -r reply || reply=""
-    [[ "$reply" == "y" ]]
+    [[ "$reply" == "y" || "$reply" == "Y" ]]
 }
 
 need_cmd() {
@@ -55,6 +75,17 @@ need_cmd() {
         return 1
     fi
     return 0
+}
+
+# Format MB/s with color depending on baseline.
+fmt_mbs() {
+    local mbs="$1"
+    local int=${mbs%.*}
+    local color="$C_RED"
+    if   (( int >= PERF_SEQ_GOOD )); then color="$C_GREEN"
+    elif (( int >= PERF_SEQ_OK ));   then color="$C_YELLOW"
+    fi
+    printf '%s%8.1f MB/s%s' "$color" "$mbs" "$C_RESET"
 }
 
 # ---- Status checks (return 0=ok, 1=warn, 2=fail) ----
@@ -160,7 +191,6 @@ check_capacity() {
         df -h "$MOUNT_POINT" 2>&1 || true
         printf '\n'
         df -i "$MOUNT_POINT" 2>&1 || true
-        # warn if inodes >80% used
         local ipct
         ipct="$(df -i "$MOUNT_POINT" --output=ipcent 2>/dev/null | tail -n1 | tr -dc '0-9')"
         if [[ -n "${ipct:-}" && "$ipct" -gt 80 ]]; then
@@ -264,14 +294,7 @@ check_fstab() {
     fi
 }
 
-# ---- Menu actions ----
-
-do_show_thunderbolt() { check_thunderbolt || true; pause; }
-do_show_pci()         { check_pci || true; pause; }
-do_show_block()       { check_block_device || true; pause; }
-do_show_fs()          { check_filesystem || true; pause; }
-do_show_capacity()    { check_capacity || true; pause; }
-do_show_dmesg()       { check_dmesg_recent || true; pause; }
+# ---- Mount actions ----
 
 do_mount() {
     hdr "Mount $DEV_PART at $MOUNT_POINT"
@@ -302,10 +325,7 @@ do_unmount() {
     pause
 }
 
-do_verify_fstab()      { check_fstab || true; pause; }
-do_verify_pci_realloc(){ check_pci_realloc || true; pause; }
-do_verify_enrollment() { check_boltctl_enrolled || true; pause; }
-do_check_failure()     { check_dmesg_failure_pattern || true; pause; }
+# ---- Maintenance ----
 
 do_fsck() {
     hdr "Offline fsck of $DEV_PART"
@@ -319,7 +339,7 @@ Requirements:
 
 EOF
     if mountpoint -q "$MOUNT_POINT"; then
-        fail "$MOUNT_POINT is currently mounted. Unmount first (option 9)."
+        fail "$MOUNT_POINT is currently mounted. Unmount first."
         pause; return
     fi
     if ! confirm_yes "Proceed with fsck?"; then
@@ -367,6 +387,8 @@ device, problem is on the Thunderbolt / PCI side, not the enclosure.
 EOF
     pause
 }
+
+# ---- Recovery ----
 
 do_pci_hotremove() {
     hdr "PCI hot-remove + rescan (RECOVERY)"
@@ -431,31 +453,219 @@ Reliable recovery (do these IN ORDER):
         sudo reboot
      A simple unmount/remount is NOT enough — the kernel SCSI layer
      keeps the dead host attached until reboot.
-  5. After reboot, run option 1 (Show full status) to confirm OK.
+  5. After reboot, run "Show full status" to confirm OK.
 
 Optional (lower-success) attempts before reboot:
-  - Option 16 in this menu (PCI hot-remove + rescan).  May hang.
+  - PCI hot-remove + rescan from the Recovery menu.  May hang.
   - sudo modprobe -r stex && sudo modprobe stex
         Often blocked because the module is in use by the wedged host.
 
 Prevention:
-  - Keep $KERNEL_PARAM in GRUB_CMDLINE_LINUX_DEFAULT (option 11).
+  - Keep $KERNEL_PARAM in GRUB_CMDLINE_LINUX_DEFAULT.
   - Maintain >=13 cm clearance behind enclosure; ambient <35 C.
   - Avoid sleep/suspend on the host while Pegasus is mounted.
 EOF
     pause
 }
 
+# ---- Performance / speed test ----
+
+# Parse an MB/s number out of dd's stderr line. dd may report KB/s, MB/s, GB/s.
+# Echoes a plain MB/s float.
+parse_dd_mbs() {
+    local line="$1"
+    awk '
+        BEGIN { mbs = 0 }
+        {
+            # find the "<num> <unit>/s" pair near the end
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /\/s,?$/) {
+                    gsub(",", "", $i)
+                    val = $(i-1)
+                    unit = $i
+                    if      (unit ~ /^GB/)  mbs = val * 1000
+                    else if (unit ~ /^MB/)  mbs = val
+                    else if (unit ~ /^kB/)  mbs = val / 1000
+                    else if (unit ~ /^B/)   mbs = val / 1000000
+                }
+            }
+            print mbs
+        }
+    ' <<<"$line"
+}
+
+# Drop OS caches so subsequent reads hit the device, not RAM.
+drop_caches() {
+    sync
+    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
+}
+
+run_speed_test() {
+    local size_label="$1" size_mb="$2"
+
+    if ! mountpoint -q "$MOUNT_POINT"; then
+        fail "$MOUNT_POINT is not mounted — cannot run speed test"
+        pause; return 1
+    fi
+
+    local avail_mb
+    avail_mb="$(df -BM --output=avail "$MOUNT_POINT" | tail -n1 | tr -dc '0-9')"
+    if [[ -n "$avail_mb" && "$avail_mb" -lt $((size_mb + 512)) ]]; then
+        fail "Insufficient free space (${avail_mb} MiB free, need ~$((size_mb + 512)) MiB)"
+        pause; return 1
+    fi
+
+    local test_file="${MOUNT_POINT}/.pegasus_speedtest.bin"
+    local t0 t1 dur
+
+    hdr "Speed test — $size_label (${size_mb} MiB, O_DIRECT)"
+    info "Test file: $test_file"
+    info "Caching:   bypassed via O_DIRECT and drop_caches"
+    printf '\n'
+
+    # Sequential write
+    info "Running sequential write..."
+    drop_caches
+    t0=$(date +%s)
+    local wline
+    wline="$(dd if=/dev/zero of="$test_file" bs=1M count="$size_mb" \
+            oflag=direct conv=fsync 2>&1 | tail -n1)"
+    t1=$(date +%s)
+    local w_mbs
+    w_mbs="$(parse_dd_mbs "$wline")"
+    local w_dur=$((t1 - t0))
+
+    # Sequential read
+    info "Running sequential read..."
+    drop_caches
+    t0=$(date +%s)
+    local rline
+    rline="$(dd if="$test_file" of=/dev/null bs=1M count="$size_mb" \
+            iflag=direct 2>&1 | tail -n1)"
+    t1=$(date +%s)
+    local r_mbs
+    r_mbs="$(parse_dd_mbs "$rline")"
+    local r_dur=$((t1 - t0))
+
+    # Raw device reads via hdparm (cached + uncached)
+    local hd_cached="" hd_uncached=""
+    if command -v hdparm >/dev/null 2>&1; then
+        info "Running hdparm raw-device probes..."
+        local hdout
+        hdout="$(sudo hdparm -Tt "$DEV_DISK" 2>/dev/null || true)"
+        # Lines look like: " Timing cached reads:   1234 MB in  2.00 seconds = 617.32 MB/sec"
+        hd_cached="$(  printf '%s\n' "$hdout" | awk -F'= *' '/cached reads/   {print $2}' | awk '{print $1}')"
+        hd_uncached="$(printf '%s\n' "$hdout" | awk -F'= *' '/buffered disk/  {print $2}' | awk '{print $1}')"
+    fi
+
+    # Optional fio random IOPS
+    local iops_r="" iops_w="" lat_r="" lat_w=""
+    if command -v fio >/dev/null 2>&1; then
+        info "Running fio 4K random read/write (10 s each, qd=32)..."
+        local fio_size_mb=$(( size_mb < 512 ? size_mb : 512 ))
+        local fio_out
+        fio_out="$(fio --name=peg-randread \
+            --filename="$test_file" --size="${fio_size_mb}M" --rw=randread \
+            --bs=4k --iodepth=32 --ioengine=libaio --direct=1 \
+            --time_based --runtime=10 --output-format=terse 2>/dev/null || true)"
+        # terse field 8 = read iops, field 40 = read clat mean (us)
+        iops_r="$(awk -F';' '{printf "%.0f", $8}'  <<<"$fio_out")"
+        lat_r="$( awk -F';' '{printf "%.2f", $40/1000}' <<<"$fio_out")"
+
+        fio_out="$(fio --name=peg-randwrite \
+            --filename="$test_file" --size="${fio_size_mb}M" --rw=randwrite \
+            --bs=4k --iodepth=32 --ioengine=libaio --direct=1 \
+            --time_based --runtime=10 --output-format=terse 2>/dev/null || true)"
+        # terse field 49 = write iops, field 81 = write clat mean (us)
+        iops_w="$(awk -F';' '{printf "%.0f", $49}'  <<<"$fio_out")"
+        lat_w="$( awk -F';' '{printf "%.2f", $81/1000}' <<<"$fio_out")"
+    fi
+
+    # Cleanup
+    rm -f "$test_file" 2>/dev/null || sudo rm -f "$test_file"
+
+    # Pretty results table
+    printf '\n'
+    printf '%s┌──────────────────────────────────────────────────────────────┐%s\n' "$C_MAGENTA" "$C_RESET"
+    printf '%s│  %sPegasus3-R Speed Test Results%s%s                              │%s\n' \
+        "$C_MAGENTA" "$C_BOLD" "$C_RESET" "$C_MAGENTA" "$C_RESET"
+    printf '%s├──────────────────────────────────────────────────────────────┤%s\n' "$C_MAGENTA" "$C_RESET"
+    printf '%s│%s  %-32s %s   %s│%s\n' \
+        "$C_MAGENTA" "$C_RESET" \
+        "Sequential Write (${size_mb} MiB)" \
+        "$(fmt_mbs "$w_mbs")" \
+        "$C_MAGENTA" "$C_RESET"
+    printf '%s│%s  %-32s %s   %s│%s\n' \
+        "$C_MAGENTA" "$C_RESET" \
+        "Sequential Read  (${size_mb} MiB)" \
+        "$(fmt_mbs "$r_mbs")" \
+        "$C_MAGENTA" "$C_RESET"
+    if [[ -n "$hd_cached" ]]; then
+        printf '%s│%s  %-32s %s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Raw Read  (cached, hdparm)" \
+            "$(fmt_mbs "$hd_cached")" \
+            "$C_MAGENTA" "$C_RESET"
+    fi
+    if [[ -n "$hd_uncached" ]]; then
+        printf '%s│%s  %-32s %s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Raw Read  (uncached, hdparm)" \
+            "$(fmt_mbs "$hd_uncached")" \
+            "$C_MAGENTA" "$C_RESET"
+    fi
+    if [[ -n "$iops_r" ]]; then
+        printf '%s├──────────────────────────────────────────────────────────────┤%s\n' "$C_MAGENTA" "$C_RESET"
+        printf '%s│%s  %-32s %s%10s IOPS%s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Random Read  (4K, qd=32)" \
+            "$C_CYAN" "$iops_r" "$C_RESET" \
+            "$C_MAGENTA" "$C_RESET"
+        printf '%s│%s  %-32s %s%10s IOPS%s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Random Write (4K, qd=32)" \
+            "$C_CYAN" "$iops_w" "$C_RESET" \
+            "$C_MAGENTA" "$C_RESET"
+        printf '%s│%s  %-32s %s%10s ms  %s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Avg Read Latency" \
+            "$C_CYAN" "$lat_r" "$C_RESET" \
+            "$C_MAGENTA" "$C_RESET"
+        printf '%s│%s  %-32s %s%10s ms  %s   %s│%s\n' \
+            "$C_MAGENTA" "$C_RESET" \
+            "Avg Write Latency" \
+            "$C_CYAN" "$lat_w" "$C_RESET" \
+            "$C_MAGENTA" "$C_RESET"
+    fi
+    printf '%s└──────────────────────────────────────────────────────────────┘%s\n' "$C_MAGENTA" "$C_RESET"
+
+    printf '\n  %sBaseline:%s green ≥ %d MB/s · yellow ≥ %d MB/s · red below.\n' \
+        "$C_DIM" "$C_RESET" "$PERF_SEQ_GOOD" "$PERF_SEQ_OK"
+    printf '  %sWrote/read in:%s %ds write + %ds read.\n' \
+        "$C_DIM" "$C_RESET" "$w_dur" "$r_dur"
+
+    if [[ -z "$hd_cached" ]]; then
+        printf '\n'; warn "hdparm not installed — install with: sudo apt install hdparm"
+    fi
+    if [[ -z "$iops_r" ]]; then
+        warn "fio not installed — install with: sudo apt install fio  (for IOPS test)"
+    fi
+}
+
+do_speed_quick()  { run_speed_test "Quick"  512;  pause; }
+do_speed_normal() { run_speed_test "Normal" 2048; pause; }
+do_speed_long()   { run_speed_test "Long"   8192; pause; }
+
+# ---- Full status summary ----
+
 do_status_full() {
     local tb_rc pci_rc blk_rc mnt_rc cap_rc realloc_rc fstab_rc dmesg_rc enroll_rc
-    tb_rc=0; pci_rc=0; blk_rc=0; mnt_rc=0; cap_rc=0
-    realloc_rc=0; fstab_rc=0; dmesg_rc=0; enroll_rc=0
 
     check_thunderbolt;          tb_rc=$?
     check_boltctl_enrolled;     enroll_rc=$?
     check_pci;                  pci_rc=$?
     check_block_device;         blk_rc=$?
-    check_filesystem;           : # informational only
+    check_filesystem || true
     check_mount;                mnt_rc=$?
     check_capacity;             cap_rc=$?
     check_pci_realloc;          realloc_rc=$?
@@ -463,100 +673,154 @@ do_status_full() {
     check_dmesg_failure_pattern; dmesg_rc=$?
 
     hdr "Summary"
-    local verdict color
-    if [[ $pci_rc -eq 2 ]]; then
-        # WEDGED if rev=ff was detected (check_pci returns 2 for that)
-        # also WEDGED if dmesg failure pattern present
-        verdict="WEDGED"
-        color="$C_RED"
-    elif [[ $dmesg_rc -eq 1 ]]; then
-        verdict="WEDGED"
-        color="$C_RED"
-    elif [[ $tb_rc -eq 2 || $blk_rc -eq 2 ]]; then
-        verdict="OFFLINE"
-        color="$C_RED"
-    elif [[ $tb_rc -eq 1 ]]; then
-        verdict="OFFLINE"
-        color="$C_RED"
+    local verdict color icon
+    if   [[ $pci_rc -eq 2 ]]; then          verdict="WEDGED";   color="$C_RED";    icon="✘"
+    elif [[ $dmesg_rc -eq 1 ]]; then        verdict="WEDGED";   color="$C_RED";    icon="✘"
+    elif [[ $tb_rc -eq 2 || $blk_rc -eq 2 ]]; then verdict="OFFLINE"; color="$C_RED"; icon="✘"
+    elif [[ $tb_rc -eq 1 ]]; then           verdict="OFFLINE";  color="$C_RED";    icon="✘"
     elif [[ $mnt_rc -ne 0 || $realloc_rc -ne 0 || $fstab_rc -ne 0 || $cap_rc -eq 1 || $enroll_rc -ne 0 ]]; then
-        verdict="DEGRADED"
-        color="$C_YELLOW"
+        verdict="DEGRADED"; color="$C_YELLOW"; icon="!"
     else
-        verdict="OK"
-        color="$C_GREEN"
+        verdict="OK"; color="$C_GREEN"; icon="✔"
     fi
-    printf '%s%sPegasus health: %s%s\n' "$color" "$C_BOLD" "$verdict" "$C_RESET"
+    printf '  %s%s  %s  Pegasus health: %s%s\n\n' \
+        "$color" "$C_BOLD" "$icon" "$verdict" "$C_RESET"
     pause
 }
 
-# ---- Main menu loop ----
+# ---- Menu rendering ----
 
-print_menu() {
-    cat <<EOF
+# Render a menu from a label/handler list, prompt, dispatch, repeat until "back".
+# Args: menu_title  back_label  label1 handler1  label2 handler2 ...
+run_menu() {
+    local title="$1"; shift
+    local back_label="$1"; shift
+    local labels=() handlers=()
+    while (( $# >= 2 )); do
+        labels+=("$1"); handlers+=("$2")
+        shift 2
+    done
 
-${C_CYAN}${C_BOLD}=== Promise Pegasus3-R Management ===${C_RESET}
+    local choice i
+    while true; do
+        printf '\n%s%s┌─ %s ──────────────────────────%s\n' "$C_BLUE" "$C_BOLD" "$title" "$C_RESET"
+        for (( i=0; i<${#labels[@]}; i++ )); do
+            printf '  %s%2d)%s %s\n' "$C_CYAN" $((i+1)) "$C_RESET" "${labels[i]}"
+        done
+        printf '  %s 0)%s %s\n\n' "$C_CYAN" "$C_RESET" "$back_label"
+        printf '%s%s ▸%s ' "$C_BLUE" "$title" "$C_RESET"
+        if ! read -r choice; then printf '\n'; return 0; fi
+        case "$choice" in
+            0|b|B|q|Q|"") return 0 ;;
+            *[!0-9]*) warn "Not a number: $choice" ;;
+            *)
+                if (( choice >= 1 && choice <= ${#labels[@]} )); then
+                    # Handlers may be "func arg" strings — eval to allow word splitting.
+                    eval "${handlers[$((choice-1))]}"
+                else
+                    warn "Out of range: $choice"
+                fi
+                ;;
+        esac
+    done
+}
 
-  ${C_BOLD}--- Status ---${C_RESET}
-  1) Show full status (one-shot summary of everything below)
-  2) Thunderbolt link status (boltctl)
-  3) PCI controller health (lspci + rev check)
-  4) Block device + partition table (lsblk + parted print)
-  5) Filesystem details (tune2fs -l)
-  6) Capacity and inode usage (df -h, df -i)
-  7) Recent kernel logs (last thunderbolt/stex/sda events)
+# ---- Submenus ----
 
-  ${C_BOLD}--- Mount ---${C_RESET}
-  8) Mount $DEV_PART at $MOUNT_POINT
-  9) Unmount $MOUNT_POINT
- 10) Verify fstab entry
+menu_status() {
+    run_menu "Status & Health" "Back to main" \
+        "Full status (one-shot summary)"               do_status_full \
+        "Thunderbolt link (boltctl)"                   "do_check check_thunderbolt" \
+        "PCI controller health (lspci + rev check)"    "do_check check_pci" \
+        "Block device + partition table"               "do_check check_block_device" \
+        "Filesystem details (tune2fs -l)"              "do_check check_filesystem" \
+        "Capacity and inode usage (df -h, df -i)"      "do_check check_capacity" \
+        "Mount status"                                 "do_check check_mount" \
+        "Recent kernel logs (thunderbolt/stex/sda)"    "do_check check_dmesg_recent"
+}
 
-  ${C_BOLD}--- Diagnostics ---${C_RESET}
- 11) Verify $KERNEL_PARAM kernel arg is active
- 12) Verify Thunderbolt enrollment (boltctl shows policy=iommu, stored)
- 13) Check for the "firmware not operational" / "handshake failed" failure pattern in dmesg
+menu_mount() {
+    run_menu "Mount Operations" "Back to main" \
+        "Mount $DEV_PART at $MOUNT_POINT"   do_mount \
+        "Unmount $MOUNT_POINT"              do_unmount \
+        "Verify fstab entry"                "do_check check_fstab"
+}
 
-  ${C_BOLD}--- Maintenance ---${C_RESET}
- 14) Run offline fsck (requires unmount; can take an hour+ on a full drive)
- 15) Show LED/alarm meaning reference card
+menu_diagnostics() {
+    run_menu "Diagnostics" "Back to main" \
+        "Verify $KERNEL_PARAM kernel arg is active"               "do_check check_pci_realloc" \
+        "Verify Thunderbolt enrollment (policy=iommu, stored)"    "do_check check_boltctl_enrolled" \
+        "Check dmesg for firmware-not-operational pattern"        "do_check check_dmesg_failure_pattern"
+}
 
-  ${C_BOLD}--- Recovery (use only if controller is wedged) ---${C_RESET}
- 16) Attempt PCI hot-remove + rescan (may hang in D-state)
- 17) Print recovery procedure for wedged controller (don't execute — just show steps)
+menu_performance() {
+    run_menu "Performance" "Back to main" \
+        "Quick speed test (512 MiB)"          do_speed_quick \
+        "Normal speed test (2 GiB)"           do_speed_normal \
+        "Long speed test (8 GiB, more accurate)" do_speed_long
+}
 
-  0) Exit
+menu_maintenance() {
+    run_menu "Maintenance" "Back to main" \
+        "Run offline fsck (requires unmount)"  do_fsck \
+        "LED / alarm reference card"           do_led_card
+}
 
-EOF
+menu_recovery() {
+    run_menu "Recovery (use only if controller is wedged)" "Back to main" \
+        "Print recovery procedure (does not execute)"    do_recovery_steps \
+        "Attempt PCI hot-remove + rescan (may hang)"     do_pci_hotremove
+}
+
+# Wrapper: call a check function then pause.
+do_check() { "$1" || true; pause; }
+
+# ---- Main menu ----
+
+print_main_banner() {
+    printf '\n%s%s╔══════════════════════════════════════════╗%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+    printf '%s%s║      Promise Pegasus3-R Management       ║%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+    printf '%s%s╚══════════════════════════════════════════╝%s\n' "$C_CYAN" "$C_BOLD" "$C_RESET"
+    # tiny live status line
+    local mnt="$C_RED✘ unmounted$C_RESET"
+    if mountpoint -q "$MOUNT_POINT"; then
+        local used
+        used="$(df -h --output=pcent "$MOUNT_POINT" 2>/dev/null | tail -n1 | tr -d ' %')"
+        mnt="$C_GREEN✔ mounted$C_RESET ${C_DIM}(${used:-?}% used)$C_RESET"
+    fi
+    printf '  %sDevice:%s %s   %sMount:%s %s   %sLabel:%s %s\n' \
+        "$C_DIM" "$C_RESET" "$DEV_PART" \
+        "$C_DIM" "$C_RESET" "$mnt" \
+        "$C_DIM" "$C_RESET" "$FS_LABEL"
 }
 
 main() {
     local choice
     while true; do
-        print_menu
-        printf '%sChoose:%s ' "$C_CYAN" "$C_RESET"
-        if ! read -r choice; then
-            printf '\n'
-            exit 0
-        fi
+        print_main_banner
+        cat <<EOF
+
+  ${C_CYAN}1)${C_RESET} ${C_BOLD}Status & Health${C_RESET}    ${C_DIM}— quick checks, full summary, kernel logs${C_RESET}
+  ${C_CYAN}2)${C_RESET} ${C_BOLD}Mount Operations${C_RESET}   ${C_DIM}— mount, unmount, verify fstab${C_RESET}
+  ${C_CYAN}3)${C_RESET} ${C_BOLD}Diagnostics${C_RESET}        ${C_DIM}— kernel args, enrollment, failure patterns${C_RESET}
+  ${C_CYAN}4)${C_RESET} ${C_BOLD}Performance${C_RESET}        ${C_DIM}— speed tests (sequential + IOPS)${C_RESET}
+  ${C_CYAN}5)${C_RESET} ${C_BOLD}Maintenance${C_RESET}        ${C_DIM}— fsck, LED reference card${C_RESET}
+  ${C_CYAN}6)${C_RESET} ${C_BOLD}Recovery${C_RESET}           ${C_DIM}— wedged-controller procedures${C_RESET}
+
+  ${C_CYAN}0)${C_RESET} Exit
+
+EOF
+        printf '%sMain ▸%s ' "$C_CYAN" "$C_RESET"
+        if ! read -r choice; then printf '\n'; exit 0; fi
         case "$choice" in
-            1)  do_status_full ;;
-            2)  do_show_thunderbolt ;;
-            3)  do_show_pci ;;
-            4)  do_show_block ;;
-            5)  do_show_fs ;;
-            6)  do_show_capacity ;;
-            7)  do_show_dmesg ;;
-            8)  do_mount ;;
-            9)  do_unmount ;;
-            10) do_verify_fstab ;;
-            11) do_verify_pci_realloc ;;
-            12) do_verify_enrollment ;;
-            13) do_check_failure ;;
-            14) do_fsck ;;
-            15) do_led_card ;;
-            16) do_pci_hotremove ;;
-            17) do_recovery_steps ;;
+            1) menu_status ;;
+            2) menu_mount ;;
+            3) menu_diagnostics ;;
+            4) menu_performance ;;
+            5) menu_maintenance ;;
+            6) menu_recovery ;;
             0|q|Q|"") info "Bye."; exit 0 ;;
-            *)  warn "Unknown choice: $choice" ;;
+            *) warn "Unknown choice: $choice" ;;
         esac
     done
 }

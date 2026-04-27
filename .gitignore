@@ -1,8 +1,3 @@
-.claude/plugins/
-.claude/skills/
-.claude/archon-config.json
-.claude/archon-state.json
-.claude/archon-memory-buffer.jsonl
-.claude/settings.local.json
+.claude/
 .mcp.json
 .archon/

@@ -147,46 +147,56 @@ The repo ships a menu-driven bash script for routine operations. Run it from any
 ./manage.sh
 ```
 
-No installation, dependencies, or environment setup — it uses only the stock Ubuntu 22.04 toolchain (`bash`, `boltctl`, `lspci`, `lsblk`, `parted`, `tune2fs`, `dmesg`, `mount`, `fsck`, `df`). Per-command `sudo` is used only where strictly required (reading `dmesg`, calling `tune2fs`, `parted print`, mount/unmount, `fsck`, and the sysfs writes for the PCI hot-remove); read-only checks run unprivileged.
+No installation, dependencies, or environment setup — it uses only the stock Ubuntu 22.04 toolchain (`bash`, `boltctl`, `lspci`, `lsblk`, `parted`, `tune2fs`, `dmesg`, `mount`, `fsck`, `df`, `dd`). Per-command `sudo` is used only where strictly required (reading `dmesg`, calling `tune2fs`, `parted print`, mount/unmount, `fsck`, dropping caches for the speed test, and the sysfs writes for the PCI hot-remove); read-only checks run unprivileged.
+
+The Performance menu uses optional helpers `hdparm` (raw-device read) and `fio` (4K random IOPS). Both are skipped gracefully when not installed; the script prints the corresponding `apt install` hint instead of failing.
 
 ### Menu
 
+The CLI is organized as a top menu with six submenus. The top menu shows a live status line (mount state and percent used) and dispatches into each submenu, which loops until you choose `0` to go back.
+
 ```
-=== Promise Pegasus3-R Management ===
+╔══════════════════════════════════════════╗
+║      Promise Pegasus3-R Management       ║
+╚══════════════════════════════════════════╝
+  Device: /dev/sda1   Mount: ✔ mounted (37% used)   Label: pegasus_raid
 
-  --- Status ---
-  1) Show full status (one-shot summary of everything below)
-  2) Thunderbolt link status (boltctl)
-  3) PCI controller health (lspci + rev check)
-  4) Block device + partition table (lsblk + parted print)
-  5) Filesystem details (tune2fs -l)
-  6) Capacity and inode usage (df -h, df -i)
-  7) Recent kernel logs (last thunderbolt/stex/sda events)
-
-  --- Mount ---
-  8) Mount /dev/sda1 at /media/pegasus
-  9) Unmount /media/pegasus
- 10) Verify fstab entry
-
-  --- Diagnostics ---
- 11) Verify pci=realloc kernel arg is active
- 12) Verify Thunderbolt enrollment (boltctl shows policy=iommu, stored)
- 13) Check for the "firmware not operational" / "handshake failed" failure pattern in dmesg
-
-  --- Maintenance ---
- 14) Run offline fsck (requires unmount; can take an hour+ on a full drive)
- 15) Show LED/alarm meaning reference card
-
-  --- Recovery (use only if controller is wedged) ---
- 16) Attempt PCI hot-remove + rescan (may hang in D-state)
- 17) Print recovery procedure for wedged controller (don't execute — just show steps)
-
+  1) Status & Health    — quick checks, full summary, kernel logs
+  2) Mount Operations   — mount, unmount, verify fstab
+  3) Diagnostics        — kernel args, enrollment, failure patterns
+  4) Performance        — speed tests (sequential + IOPS)
+  5) Maintenance        — fsck, LED reference card
+  6) Recovery           — wedged-controller procedures
   0) Exit
 ```
 
+Submenu contents:
+
+| Submenu | Options |
+|---|---|
+| **Status & Health** | Full status summary · Thunderbolt link · PCI controller health · Block device + partition table · Filesystem details · Capacity / inodes · Mount status · Recent kernel logs |
+| **Mount Operations** | Mount `/dev/sda1` at `/media/pegasus` · Unmount · Verify fstab entry |
+| **Diagnostics** | Verify `pci=realloc` kernel arg · Verify Thunderbolt enrollment (`policy=iommu`, stored) · Check dmesg for `firmware not operational` / `handshake failed` |
+| **Performance** | Quick (512 MiB) · Normal (2 GiB) · Long (8 GiB, more accurate) speed tests |
+| **Maintenance** | Offline `fsck` (requires unmount) · LED / alarm reference card |
+| **Recovery** | Print recovery procedure (read-only) · Attempt PCI hot-remove + rescan (may hang) |
+
+### Performance / speed test
+
+The Performance submenu runs a self-contained benchmark against the mounted filesystem. Each test:
+
+1. Verifies the volume is mounted and that there is enough free space (test size + 512 MiB headroom)
+2. Drops the kernel page cache and runs **sequential write** with `dd … bs=1M oflag=direct conv=fsync`
+3. Drops the cache again and runs **sequential read** with `dd … bs=1M iflag=direct`
+4. If `hdparm` is installed, runs `hdparm -Tt /dev/sda` for **raw cached and uncached reads**
+5. If `fio` is installed, runs **4K random read and write** at queue depth 32 for 10 s each, reporting IOPS and average latency
+6. Cleans up the temporary test file (`/media/pegasus/.pegasus_speedtest.bin`)
+
+Results are rendered in a colored table; sequential MB/s figures are colored against a baseline (`PERF_SEQ_GOOD` / `PERF_SEQ_OK` constants at the top of `manage.sh`, default 700 / 350 MB/s for a Pegasus3-R RAID5 of SSDs over Thunderbolt 3). Lower the thresholds if you have a spinning-disk array.
+
 ### Health verdict
 
-Option 1 produces a single-line verdict at the bottom of the report. The verdict precedence is:
+`Status & Health → Full status` produces a single-line verdict at the bottom of the report. The verdict precedence is:
 
 | Verdict | Trigger |
 |---|---|
@@ -197,38 +207,40 @@ Option 1 produces a single-line verdict at the bottom of the report. The verdict
 
 A wedged controller can never appear "OK" — the precedence is enforced explicitly.
 
-### Sample output (option 1)
+### Sample output (Full status)
+
+Status indicators render as colored bullets (`●`); reproduced here in plain text:
 
 ```
-[ OK ] Thunderbolt: authorized (rx/tx 40 Gb/s)
-[ OK ] PCI controller 0000:9f:00.0 [105a:8870] rev 01, driver=stex
-[ OK ] Block device sda1 present, FS=ext4 LABEL=pegasus_raid
-[ OK ] Filesystem clean, last check OK
-[ OK ] Mounted: /dev/sda1 /media/pegasus ext4 rw,relatime
-[ OK ] Capacity: 17T total, 11 of 274.7M inodes used
-[ OK ] pci=realloc is active
-[ OK ] fstab references UUID 833dd228-35bf-4069-94f9-d98f215b8092
-[ OK ] No firmware-not-operational / handshake-failed events
+● Thunderbolt: authorized (rx/tx 40 Gb/s)
+● PCI controller 0000:9f:00.0 [105a:8870] rev 01, driver=stex
+● Block device sda1 present, FS=ext4 LABEL=pegasus_raid
+● Filesystem clean, last check OK
+● Mounted: /dev/sda1 /media/pegasus ext4 rw,relatime
+● Capacity: 17T total, 11 of 274.7M inodes used
+● pci=realloc is active
+● fstab references UUID 833dd228-35bf-4069-94f9-d98f215b8092
+● No firmware-not-operational / handshake-failed events
 
-Pegasus health: OK
+✔  Pegasus health: OK
 ```
 
 ### Destructive options — confirmation gated
 
-Two menu items can affect device state and require typed `y` confirmation (default no):
+Two actions can affect device state and require typed `y` confirmation (default no):
 
-- **14 — Offline fsck.** Unmounts the filesystem, runs `fsck.ext4 -fyv /dev/sda1`, then re-mounts. On a full 18 TB drive this can take an hour or more; the script estimates and warns. Anything else accessing `/media/pegasus` will see I/O errors during the run.
-- **16 — PCI hot-remove + rescan.** Writes `1` to `/sys/bus/pci/devices/0000:9f:00.0/remove` then to `/sys/bus/pci/rescan`. Documented as a community workaround for the wedged-controller case but observed in our own testing to hang in `D` state when the device is genuinely wedged — at which point only a host reboot recovers it. The script warns about this explicitly. Option 17 is the read-only counterpart that just prints the recovery procedure.
+- **Maintenance → Offline fsck.** Unmounts the filesystem, runs `fsck.ext4 -fy /dev/sda1`, then re-mounts. On a full 18 TB drive this can take an hour or more; the script warns up front. Anything else accessing `/media/pegasus` will see I/O errors during the run.
+- **Recovery → PCI hot-remove + rescan.** Writes `1` to `/sys/bus/pci/devices/0000:9f:00.0/remove` then to `/sys/bus/pci/rescan`. Documented as a community workaround for the wedged-controller case but observed in our own testing to hang in `D` state when the device is genuinely wedged — at which point only a host reboot recovers it. The script warns about this explicitly. The sibling **Print recovery procedure** option is the read-only counterpart that just shows the steps.
 
 ### Use as a one-liner
 
-The script is designed to be interactive, but option 1 ("Show full status") followed by `0` (Exit) gives a fast non-interactive health check suitable for scripting:
+The script is designed to be interactive, but the path `Main → Status & Health → Full status` gives a fast non-interactive health check suitable for scripting. Each prompt eats one line of input; the blank line between selections acknowledges the "Press Enter to continue" pause:
 
 ```bash
-printf "1\n\n0\n" | ./manage.sh
+printf '1\n1\n\n0\n0\n' | ./manage.sh
 ```
 
-Pipe to `grep -E '^\[(WARN|FAIL)\]|Pegasus health'` to extract just the actionable lines.
+The two trailing `0`s exit the Status & Health submenu and then the main menu. Pipe to `grep -E '●|Pegasus health'` to extract just the bullet/verdict lines.
 
 ---
 
