@@ -17,10 +17,10 @@ SCSI_DRIVER="stex"
 FS_TYPE="ext4"
 KERNEL_PARAM="pci=realloc"
 
-# Performance baselines (Pegasus3-R over Thunderbolt 2/3, RAID5 of 4x SSDs)
-# Used purely to colorize speed-test output.
-PERF_SEQ_GOOD=700      # MB/s — green at/above
-PERF_SEQ_OK=350        # MB/s — yellow at/above, red below
+# Performance baselines (Pegasus3-R over Thunderbolt 3, 4x HDD RAID5).
+# Used purely to colorize speed-test output. Bump for SSD arrays.
+PERF_SEQ_GOOD=500      # MB/s — green at/above
+PERF_SEQ_OK=250        # MB/s — yellow at/above, red below
 
 # ---- Colors (disabled when stdout is not a TTY) ----
 if [[ -t 1 ]]; then
